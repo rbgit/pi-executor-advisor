@@ -30,15 +30,21 @@ This is useful when you want a fast or inexpensive executor model to do the work
 
 The advisor cannot call tools and does not directly mutate files. It only returns text guidance.
 
-## Relationship to "How to Train Your Advisor"
+## Design inspiration
 
-This repository was reviewed against the paper **"How to Train Your Advisor: Steering Black-Box LLMs with Advisor Models"** (arXiv:2510.02453). The paper's main contribution is RL-training lightweight advisor models to produce dynamic, instance-specific advice for black-box student models. This repo does **not** implement RL training, reward optimization, or advisor model fine-tuning. It implements a lightweight runtime integration for pi.
+This package is inspired by two advisor-style model collaboration ideas:
 
-| Paper idea | This repo | Gap | Action taken |
+- **"How to Train Your Advisor: Steering Black-Box LLMs with Advisor Models"** (arXiv:2510.02453), which studies trained advisor models that generate dynamic, per-instance natural-language advice for black-box student models.
+- Anthropic's **"The Advisor Strategy"** blog post, which describes a practical executor/advisor split where a working model consults a stronger model for private strategic guidance.
+
+This repository is an independent pi package. It is not affiliated with Anthropic or the paper authors, and it does **not** implement Anthropic's native advisor tool. It also does **not** implement RL training, reward optimization, transferability experiments, or advisor model fine-tuning. Instead, it implements a lightweight, provider-agnostic runtime integration for pi.
+
+| Inspiration | This repo | Gap | Action taken |
 |---|---|---|---|
-| Dynamic, per-instance natural-language advice | The `advisor` tool sends the current transcript to a configured model and returns advice to the executor. | Advisor quality depends on the chosen model/prompt; no learned policy. | Kept provider-agnostic runtime design. |
+| Dynamic, per-instance natural-language advice from arXiv:2510.02453 | The `advisor` tool sends the current transcript to a configured model and returns advice to the executor. | Advisor quality depends on the chosen model/prompt; no learned policy. | Kept provider-agnostic runtime design. |
 | 3-step/verifier setup: student attempt → advisor critique → revised student answer | The advisor sees the transcript, including orientation, attempts, and tool observations when called. | Previously prompted mostly as broad strategy. | Updated advisor system prompt to act as a concrete verifier/critic when evidence or an attempt exists. |
 | Multi-turn advising cadence | The executor chooses when to call the advisor. | Purely dynamic tool-calling can under-use advisors. | Added `/advisor-cadence` to steer periodic re-consultation every N meaningful tool/action observations. |
+| Executor/advisor split from Anthropic's Advisor Strategy | The active pi model remains the executor; advisor output is private tool guidance. | This uses pi's provider registry, not Anthropic's server-side advisor pairing. | Implemented a portable client-side advisor tool. |
 | RL reward training and transferability | Not implemented. | Requires training data, reward functions, and model update infrastructure outside this extension. | Documented as out of scope for this runtime package. |
 
 ## Repository layout
