@@ -6,13 +6,13 @@ A provider-agnostic **advisor tool** for [pi](https://github.com/earendil-works/
 
 ```mermaid
 flowchart LR
-  U[User task] --> P[pi session]
-  P --> E[Executor model]
-  E -->|normal tool use| T[Files, shell, tests, project context]
-  E -->|advisor tool call| X[pi-executor-advisor extension]
-  X -->|serialized current transcript| A[Configured advisor model]
-  A -->|private PLAN / CHECKS / STOP| E
-  E --> R[User-facing answer]
+  U["User task"] --> P["pi session"]
+  P --> E["Executor model"]
+  E --> T["Normal tools: files, shell, tests"]
+  E --> X["advisor tool"]
+  X --> A["Configured advisor model"]
+  A --> E
+  E --> R["User-facing answer"]
 ```
 
 ## What problem does this solve?
