@@ -4,6 +4,11 @@ A provider-agnostic **advisor tool** for [pi](https://github.com/earendil-works/
 
 `pi-executor-advisor` lets your active pi model remain the **executor** while privately consulting another, usually stronger, **advisor** model for strategy, verification, and course correction. The executor keeps tool access and writes the final answer; the advisor only returns private guidance.
 
+Inspired by:
+
+- Anthropic: [The Advisor Strategy](https://claude.com/blog/the-advisor-strategy)
+- Paper: [How to Train Your Advisor: Steering Black-Box LLMs with Advisor Models](https://arxiv.org/pdf/2510.02453)
+
 ```mermaid
 flowchart LR
   U["User task"] --> P["pi session"]
