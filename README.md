@@ -1,10 +1,72 @@
 # pi-executor-advisor
 
-A provider-agnostic **advisor tool** for [pi](https://github.com/earendil-works/pi-coding-agent)-style coding agent workflows.
+A provider-agnostic **advisor tool** for [pi](https://github.com/earendil-works/pi-coding-agent) coding-agent workflows.
 
-`pi-executor-advisor` keeps your active model as the **executor** while giving it an optional private `advisor` tool backed by another, usually stronger, model. The executor can ask the advisor for strategy, checks, and course corrections, then continue using its normal tools and producing the user-facing answer.
+`pi-executor-advisor` lets your active pi model remain the **executor** while privately consulting another, usually stronger, **advisor** model for strategy, verification, and course correction. The executor keeps tool access and writes the final answer; the advisor only returns private guidance.
 
-This is useful when you want a fast or inexpensive executor model to do the work while periodically consulting a stronger reviewer model for hard decisions.
+```mermaid
+flowchart LR
+  U[User task] --> P[pi session]
+  P --> E[Executor model]
+  E -->|normal tool use| T[Files, shell, tests, project context]
+  E -->|advisor tool call| X[pi-executor-advisor extension]
+  X -->|serialized current transcript| A[Configured advisor model]
+  A -->|private PLAN / CHECKS / STOP| E
+  E --> R[User-facing answer]
+```
+
+## What problem does this solve?
+
+Coding agents often face moments where a second model is useful:
+
+- before touching risky code
+- after initial repo orientation
+- when debugging gets stuck
+- when the plan may be wrong
+- before declaring a difficult task complete
+- when a cheap/fast executor could benefit from a stronger verifier
+
+Most model-switching workflows make you manually copy context between models. This package gives the executor a first-class `advisor` tool. The current transcript is sent to the configured advisor model, the advisor returns concise private guidance, and the executor continues in the same pi session.
+
+## Who is this for?
+
+Use this if you:
+
+- use pi for coding/research tasks
+- want an executor/advisor workflow without leaving the terminal
+- want to pair a fast executor with a stronger reviewer
+- want advisor calls to include current transcript context automatically
+- want provider-agnostic model pairing instead of a vendor-specific advisor feature
+
+This is probably **not** what you want if you need RL-trained advisor models, automatic reward optimization, or Anthropic's native server-side advisor tool.
+
+## Quick start
+
+Install from GitHub:
+
+```bash
+pi install git:github.com/rbgit/pi-executor-advisor
+```
+
+Enable an advisor model in pi:
+
+```text
+/advisor-on openai/gpt-5.3
+```
+
+Or set both executor and advisor together:
+
+```text
+/advisor-pair executor:kimi-k2.5 advisor:gpt-5.5 max:3 words:120
+```
+
+Check status:
+
+```text
+/advisor-status
+```
+
+Once enabled, the executor can call the `advisor` tool during coding/research tasks.
 
 ## Features
 
@@ -12,72 +74,21 @@ This is useful when you want a fast or inexpensive executor model to do the work
 - **Provider agnostic** — works with any models registered in pi, not only Claude-native advisor pairs.
 - **Private guidance** — advisor output is returned to the executor as tool output, not directly to the user.
 - **Transcript-aware advice** — sends the current branch transcript to the advisor model.
+- **Verifier-oriented prompting** — when a transcript already contains a plan, attempt, or tool observations, the advisor is prompted to critique concrete evidence instead of giving generic tips.
 - **Configurable limits** — cap advisor calls per user task and target response length.
 - **Configurable advising cadence** — nudge the executor to re-consult the advisor periodically on long multi-step tasks.
-- **Verifier-oriented advice** — when a transcript already contains a plan, attempt, or tool observations, the advisor is prompted to critique concrete evidence instead of giving generic tips.
 - **Model resolution helpers** — use exact `provider/model`, exact model id, or a unique fuzzy substring.
 - **No extra service** — this extension runs inside pi; no daemon or web server is required.
 
-## How it works
-
-1. You enable the extension and configure an advisor model.
-2. The extension adds an `advisor` tool to pi's active tools.
-3. For enabled sessions, it appends guidance telling the executor when to call the advisor.
-4. When the executor calls `advisor`, the extension serializes the current conversation branch.
-5. The serialized transcript is sent to the configured advisor model using pi's provider registry.
-6. The advisor returns concise private guidance to the executor.
-7. The executor remains responsible for all tool use and user-facing responses.
-
-The advisor cannot call tools and does not directly mutate files. It only returns text guidance.
-
-## Design inspiration
-
-This package is inspired by two advisor-style model collaboration ideas:
-
-- **"How to Train Your Advisor: Steering Black-Box LLMs with Advisor Models"** (arXiv:2510.02453), which studies trained advisor models that generate dynamic, per-instance natural-language advice for black-box student models.
-- Anthropic's **"The Advisor Strategy"** blog post, which describes a practical executor/advisor split where a working model consults a stronger model for private strategic guidance.
-
-This repository is an independent pi package. It is not affiliated with Anthropic or the paper authors, and it does **not** implement Anthropic's native advisor tool. It also does **not** implement RL training, reward optimization, transferability experiments, or advisor model fine-tuning. Instead, it implements a lightweight, provider-agnostic runtime integration for pi.
-
-| Inspiration | This repo | Gap | Action taken |
-|---|---|---|---|
-| Dynamic, per-instance natural-language advice from arXiv:2510.02453 | The `advisor` tool sends the current transcript to a configured model and returns advice to the executor. | Advisor quality depends on the chosen model/prompt; no learned policy. | Kept provider-agnostic runtime design. |
-| 3-step/verifier setup: student attempt → advisor critique → revised student answer | The advisor sees the transcript, including orientation, attempts, and tool observations when called. | Previously prompted mostly as broad strategy. | Updated advisor system prompt to act as a concrete verifier/critic when evidence or an attempt exists. |
-| Multi-turn advising cadence | The executor chooses when to call the advisor. | Purely dynamic tool-calling can under-use advisors. | Added `/advisor-cadence` to steer periodic re-consultation every N meaningful tool/action observations. |
-| Executor/advisor split from Anthropic's Advisor Strategy | The active pi model remains the executor; advisor output is private tool guidance. | This uses pi's provider registry, not Anthropic's server-side advisor pairing. | Implemented a portable client-side advisor tool. |
-| RL reward training and transferability | Not implemented. | Requires training data, reward functions, and model update infrastructure outside this extension. | Documented as out of scope for this runtime package. |
-
-## Repository layout
-
-```text
-.
-├── package.json
-├── README.md
-└── extensions/
-    └── advisor/
-        └── index.ts
-```
-
-This package currently ships one pi extension: `extensions/advisor/index.ts`.
-
-## Requirements
-
-- pi installed and working.
-- Node.js compatible with your pi installation.
-- At least one configured model provider/API key in pi.
-- Optional but recommended: a stronger advisor model than your executor model.
-
-## Installation
+## Installation and setup
 
 ### Install from GitHub
-
-After this repository is pushed to GitHub, install it as a pi package:
 
 ```bash
 pi install git:github.com/rbgit/pi-executor-advisor
 ```
 
-SSH form also works if your GitHub SSH key is configured:
+SSH form:
 
 ```bash
 pi install git:git@github.com:rbgit/pi-executor-advisor.git
@@ -85,16 +96,16 @@ pi install git:git@github.com:rbgit/pi-executor-advisor.git
 
 ### Install from a local checkout
 
-From anywhere:
+```bash
+git clone git@github.com:rbgit/pi-executor-advisor.git
+cd pi-executor-advisor
+pi install .
+```
+
+Or install from an absolute local path:
 
 ```bash
 pi install /home/rachit/ai_projects/executor-advisor
-```
-
-Or from this repo:
-
-```bash
-pi install .
 ```
 
 ### Development mode
@@ -114,27 +125,17 @@ ln -s /home/rachit/ai_projects/executor-advisor/extensions/advisor ~/.pi/agent/e
 
 Then run `/reload` in pi after edits.
 
-## Quick start
+## How it works
 
-Enable an advisor model:
+1. You enable the extension and configure an advisor model.
+2. The extension adds an `advisor` tool to pi's active tools.
+3. For enabled sessions, it appends guidance telling the executor when to call the advisor.
+4. When the executor calls `advisor`, the extension serializes the current conversation branch.
+5. The serialized transcript is sent to the configured advisor model using pi's provider registry.
+6. The advisor returns concise private guidance to the executor.
+7. The executor remains responsible for all tool use and user-facing responses.
 
-```text
-/advisor-on openai/gpt-5.3
-```
-
-Or switch both executor and advisor in one command:
-
-```text
-/advisor-pair executor:kimi-k2.5 advisor:gpt-5.5 max:3 words:120
-```
-
-Check status:
-
-```text
-/advisor-status
-```
-
-Once enabled, the executor can call the `advisor` tool during coding/research tasks.
+The advisor cannot call tools and does not directly mutate files. It only returns text guidance.
 
 ## Commands
 
@@ -198,6 +199,23 @@ Default configuration:
 ```
 
 Most users only need the commands above. Advanced users may edit `advisor.json` directly while pi is not running.
+
+## Design inspiration
+
+This package is inspired by two advisor-style model collaboration ideas:
+
+- **"How to Train Your Advisor: Steering Black-Box LLMs with Advisor Models"** (arXiv:2510.02453), which studies trained advisor models that generate dynamic, per-instance natural-language advice for black-box student models.
+- Anthropic's **"The Advisor Strategy"** blog post, which describes a practical executor/advisor split where a working model consults a stronger model for private strategic guidance.
+
+This repository is an independent pi package. It is not affiliated with Anthropic or the paper authors, and it does **not** implement Anthropic's native advisor tool. It also does **not** implement RL training, reward optimization, transferability experiments, or advisor model fine-tuning. Instead, it implements a lightweight, provider-agnostic runtime integration for pi.
+
+| Inspiration | This repo | Gap | Action taken |
+|---|---|---|---|
+| Dynamic, per-instance natural-language advice from arXiv:2510.02453 | The `advisor` tool sends the current transcript to a configured model and returns advice to the executor. | Advisor quality depends on the chosen model/prompt; no learned policy. | Kept provider-agnostic runtime design. |
+| 3-step/verifier setup: student attempt → advisor critique → revised student answer | The advisor sees the transcript, including orientation, attempts, and tool observations when called. | Previously prompted mostly as broad strategy. | Updated advisor system prompt to act as a concrete verifier/critic when evidence or an attempt exists. |
+| Multi-turn advising cadence | The executor chooses when to call the advisor. | Purely dynamic tool-calling can under-use advisors. | Added `/advisor-cadence` to steer periodic re-consultation every N meaningful tool/action observations. |
+| Executor/advisor split from Anthropic's Advisor Strategy | The active pi model remains the executor; advisor output is private tool guidance. | This uses pi's provider registry, not Anthropic's server-side advisor pairing. | Implemented a portable client-side advisor tool. |
+| RL reward training and transferability | Not implemented. | Requires training data, reward functions, and model update infrastructure outside this extension. | Documented as out of scope for this runtime package. |
 
 ## Security and privacy
 
@@ -291,6 +309,33 @@ or continue without further advisor calls.
 
 The extension truncates very large transcripts using `maxTranscriptChars`. Increase it in `~/.pi/agent/advisor.json` if needed, but expect higher token usage and cost.
 
+## Repository layout
+
+```text
+.
+├── LICENSE
+├── package.json
+├── README.md
+└── extensions/
+    └── advisor/
+        └── index.ts
+```
+
+This package currently ships one pi extension: `extensions/advisor/index.ts`.
+
+## Package manifest
+
+`package.json` declares this as a pi package:
+
+```json
+{
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/advisor/index.ts"]
+  }
+}
+```
+
 ## Development
 
 Clone the repo:
@@ -321,22 +366,9 @@ grep -n "registerCommand\|registerTool" extensions/advisor/index.ts
 
 Pi loads TypeScript extensions through its runtime loader, so no compile step is required for normal local use.
 
-## Package manifest
-
-`package.json` declares this as a pi package:
-
-```json
-{
-  "keywords": ["pi-package"],
-  "pi": {
-    "extensions": ["./extensions/advisor/index.ts"]
-  }
-}
-```
-
 ## Contributing
 
-Contributions are welcome once this repository is published.
+Contributions are welcome.
 
 Suggested workflow:
 
@@ -348,7 +380,7 @@ Suggested workflow:
 
 ## License
 
-No license has been added yet. Add a `LICENSE` file before publishing if you want others to have explicit rights to use, modify, and redistribute the project.
+MIT. See [`LICENSE`](./LICENSE).
 
 ## Status
 
