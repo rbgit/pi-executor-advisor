@@ -13,6 +13,8 @@ This is useful when you want a fast or inexpensive executor model to do the work
 - **Private guidance** — advisor output is returned to the executor as tool output, not directly to the user.
 - **Transcript-aware advice** — sends the current branch transcript to the advisor model.
 - **Configurable limits** — cap advisor calls per user task and target response length.
+- **Configurable advising cadence** — nudge the executor to re-consult the advisor periodically on long multi-step tasks.
+- **Verifier-oriented advice** — when a transcript already contains a plan, attempt, or tool observations, the advisor is prompted to critique concrete evidence instead of giving generic tips.
 - **Model resolution helpers** — use exact `provider/model`, exact model id, or a unique fuzzy substring.
 - **No extra service** — this extension runs inside pi; no daemon or web server is required.
 
@@ -27,6 +29,17 @@ This is useful when you want a fast or inexpensive executor model to do the work
 7. The executor remains responsible for all tool use and user-facing responses.
 
 The advisor cannot call tools and does not directly mutate files. It only returns text guidance.
+
+## Relationship to "How to Train Your Advisor"
+
+This repository was reviewed against the paper **"How to Train Your Advisor: Steering Black-Box LLMs with Advisor Models"** (arXiv:2510.02453). The paper's main contribution is RL-training lightweight advisor models to produce dynamic, instance-specific advice for black-box student models. This repo does **not** implement RL training, reward optimization, or advisor model fine-tuning. It implements a lightweight runtime integration for pi.
+
+| Paper idea | This repo | Gap | Action taken |
+|---|---|---|---|
+| Dynamic, per-instance natural-language advice | The `advisor` tool sends the current transcript to a configured model and returns advice to the executor. | Advisor quality depends on the chosen model/prompt; no learned policy. | Kept provider-agnostic runtime design. |
+| 3-step/verifier setup: student attempt → advisor critique → revised student answer | The advisor sees the transcript, including orientation, attempts, and tool observations when called. | Previously prompted mostly as broad strategy. | Updated advisor system prompt to act as a concrete verifier/critic when evidence or an attempt exists. |
+| Multi-turn advising cadence | The executor chooses when to call the advisor. | Purely dynamic tool-calling can under-use advisors. | Added `/advisor-cadence` to steer periodic re-consultation every N meaningful tool/action observations. |
+| RL reward training and transferability | Not implemented. | Requires training data, reward functions, and model update infrastructure outside this extension. | Documented as out of scope for this runtime package. |
 
 ## Repository layout
 
@@ -127,6 +140,7 @@ Once enabled, the executor can call the `advisor` tool during coding/research ta
 | `/advisor-pair executor:<model> advisor:<model> [max:<n>] [words:<n>]` | Set executor and advisor models together. |
 | `/advisor-max <n>` | Set maximum advisor calls per user task. |
 | `/advisor-words <n>` | Set target advisor response length. |
+| `/advisor-cadence <n\|off>` | Set recommended re-consult cadence for long multi-step tasks. This is prompt steering, not enforcement. |
 | `/advisor-reset` | Reset extension configuration to defaults. |
 
 ### Model specs
@@ -172,6 +186,7 @@ Default configuration:
   "maxWords": 120,
   "maxOutputTokens": 2048,
   "maxTranscriptChars": 120000,
+  "advisorCadence": 5,
   "thinkingLevel": "off"
 }
 ```
@@ -239,6 +254,22 @@ instead of:
 ```text
 /advisor-on gpt
 ```
+
+### Advisor cadence is too frequent or too sparse
+
+Set the suggested re-consult interval:
+
+```text
+/advisor-cadence 5
+```
+
+Disable periodic cadence guidance:
+
+```text
+/advisor-cadence off
+```
+
+This setting is prompt steering. It nudges the executor when to ask for advice, but it does not enforce tool-call timing.
 
 ### Advisor call limit reached
 

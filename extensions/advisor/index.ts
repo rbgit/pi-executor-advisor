@@ -23,6 +23,7 @@ interface Config {
 	maxWords: number;
 	maxOutputTokens: number;
 	maxTranscriptChars: number;
+	advisorCadence: number;
 	thinkingLevel: ModelThinkingLevel;
 }
 
@@ -50,6 +51,7 @@ const DEFAULT_CONFIG: Config = {
 	maxWords: 120,
 	maxOutputTokens: 2048,
 	maxTranscriptChars: 120_000,
+	advisorCadence: 5,
 	thinkingLevel: "off",
 };
 
@@ -57,21 +59,29 @@ const ADVISOR_SYSTEM = `You are a private advisor for a coding/research executor
 
 You see a serialized transcript of the executor's work. You do not call tools. You do not write user-facing final answers. Give strategic guidance to the executor only.
 
+Generate dynamic, instance-specific advice. If the transcript includes an initial plan, implementation attempt, tool observations, or partial result, act primarily as a verifier/critic: identify concrete flaws, missing evidence, risky assumptions, and the smallest next checks that would improve the outcome.
+
+Prefer clear, immediately actionable guidance over broad summaries. For coding tasks, mention exact files, commands, tests, or observations when visible; prefer efficient targeted exploration (for example rg/grep, focused reads, narrow tests) over generic advice. Avoid vague encouragement.
+
 Return one concise response with:
 - PLAN: the best next approach, if work remains
 - CHECKS: specific risks, tests, or evidence to verify
-- STOP: say stop only if the executor should not proceed or should ask the user
+- WHEN_TO_RECONSULT: when the executor should call advisor again, if useful
+- STOP: say stop only if the executor should not proceed or should ask the user`;
 
-Prefer course corrections over broad summaries. Mention exact files, commands, assumptions, and contradictions when visible.`;
-
-const EXECUTOR_GUIDANCE = `
+function executorGuidance(config: Config) {
+	const cadence = config.advisorCadence > 0
+		? `\nFor long multi-step tasks, use advisor as a periodic verifier after roughly ${config.advisorCadence} meaningful tool/action observations, or sooner when evidence contradicts the plan.`
+		: "";
+	return `
 
 Advisor strategy guidance:
 You have access to an \`advisor\` tool backed by a stronger reviewer model. It takes no parameters. When you call advisor(), the current transcript is forwarded and private guidance is returned.
 
-Call advisor before substantive work on complex tasks: after quick orientation reads, before writing/editing, before committing to an interpretation, when stuck, when changing approach, and before declaring a difficult task complete after making results durable.
+Call advisor before substantive work on complex tasks: after quick orientation reads, before writing/editing, before committing to an interpretation, when stuck, when changing approach, and before declaring a difficult task complete after making results durable.${cadence}
 
-Give advisor guidance serious weight. If tool evidence contradicts it, reconcile explicitly instead of silently switching branches. The advisor never calls tools and never produces user-facing output; you remain the executor.`;
+Treat advisor output as verifier guidance over your current trajectory: reconcile it against tool evidence, adopt concrete checks where sensible, and explicitly note any contradiction instead of silently switching branches. The advisor never calls tools and never produces user-facing output; you remain the executor.`;
+}
 
 function configPath() {
 	const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
@@ -244,6 +254,7 @@ function statusText(config: Config, executor?: Model<Api>) {
 		`advisor model: ${formatModel(config.advisor)}`,
 		`max uses/task: ${config.maxUsesPerTask}`,
 		`target words: ${config.maxWords}`,
+		`advisor cadence: ${config.advisorCadence > 0 ? `~${config.advisorCadence} meaningful steps` : "off"}`,
 		`config: ${configPath()}`,
 	].join("\n");
 }
@@ -336,6 +347,21 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("advisor-cadence", {
+		description: "Set recommended advisor re-consult cadence in meaningful tool/action steps, or off",
+		handler: async (args, ctx) => {
+			const raw = args.trim().toLowerCase();
+			const value = raw === "off" || raw === "0" ? 0 : Number(raw);
+			if (!Number.isInteger(value) || value < 0) {
+				ctx.ui.notify("Usage: /advisor-cadence <non-negative integer|off>", "error");
+				return;
+			}
+			persist({ ...config, advisorCadence: value });
+			updateStatus(ctx);
+			ctx.ui.notify(value > 0 ? `Advisor cadence: ~${value} meaningful steps` : "Advisor cadence disabled", "info");
+		},
+	});
+
 	pi.registerCommand("advisor-reset", {
 		description: "Reset advisor extension configuration",
 		handler: async (_args, ctx) => {
@@ -387,7 +413,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		if (!config.enabled || !config.advisor) return;
-		return { systemPrompt: `${EXECUTOR_GUIDANCE}\n\n${event.systemPrompt}` };
+		return { systemPrompt: `${executorGuidance(config)}\n\n${event.systemPrompt}` };
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -402,6 +428,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Consult a stronger model for private plan/correction guidance; no parameters.",
 		promptGuidelines: [
 			"Use advisor before substantive work on complex coding/research tasks, after quick orientation, when stuck, before changing approach, and before declaring difficult work complete.",
+			"Use advisor as a verifier over the current trajectory: let it critique concrete tool evidence, partial plans, and implementation attempts.",
 			"The advisor tool takes no parameters; do not pass text or questions to advisor.",
 		],
 		parameters: Type.Object({}),
@@ -446,7 +473,7 @@ export default function (pi: ExtensionAPI) {
 			const serialized = serializeConversation(llmMessages);
 			const truncated = truncateTranscript(serialized, config.maxTranscriptChars);
 
-			const advisorPrompt = `<executor_context>\nExecutor model: ${ctx.model ? modelLabel(ctx.model) : "unknown"}\nWorking directory: ${ctx.cwd}\nAdvisor call: ${callsUsed + 1}/${config.maxUsesPerTask}\nTranscript truncated: ${truncated.truncated ? "yes" : "no"}\n</executor_context>\n\n<transcript>\n${truncated.text}\n</transcript>\n\nGive private guidance to the executor now. Keep it under ${config.maxWords} words.`;
+			const advisorPrompt = `<executor_context>\nExecutor model: ${ctx.model ? modelLabel(ctx.model) : "unknown"}\nWorking directory: ${ctx.cwd}\nAdvisor call: ${callsUsed + 1}/${config.maxUsesPerTask}\nRecommended re-consult cadence: ${config.advisorCadence > 0 ? `~${config.advisorCadence} meaningful executor observations` : "off"}\nTranscript truncated: ${truncated.truncated ? "yes" : "no"}\n</executor_context>\n\n<transcript>\n${truncated.text}\n</transcript>\n\nGive private guidance to the executor now. Keep it under ${config.maxWords} words. Be concrete, evidence-grounded, and verifier-oriented when the transcript contains an initial attempt or tool observations.`;
 
 			const advisorMessages: Message[] = [
 				{
