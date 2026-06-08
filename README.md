@@ -17,6 +17,8 @@ flowchart LR
   E --> X["advisor tool"]
   X --> A["Configured advisor model"]
   A --> E
+  X --> L["local event log"]
+  L --> D["dashboard and chat view"]
   E --> R["User-facing answer"]
 ```
 
@@ -71,7 +73,20 @@ Check status:
 /advisor-status
 ```
 
-Once enabled, the executor can call the `advisor` tool during coding/research tasks.
+Open the local dashboard/chat server:
+
+```text
+/advisor-dashboard
+```
+
+Default URLs:
+
+```text
+http://127.0.0.1:5000/       # event dashboard
+http://127.0.0.1:5000/chat   # chat-style executor/advisor view
+```
+
+Once enabled, the executor can call the `advisor` tool during coding/research tasks. The chat page will populate as new local advisor-gate events are recorded.
 
 ## Features
 
@@ -83,7 +98,8 @@ Once enabled, the executor can call the `advisor` tool during coding/research ta
 - **Configurable limits** — cap advisor calls per user task and target response length.
 - **Configurable advising cadence** — nudge the executor to re-consult the advisor periodically on long multi-step tasks.
 - **Model resolution helpers** — use exact `provider/model`, exact model id, or a unique fuzzy substring.
-- **No extra service** — this extension runs inside pi; no daemon or web server is required.
+- **Local dashboard and chat view** — bundled observability extension shows advisor events at `/` and iMessage-style executor/advisor conversations at `/chat`.
+- **Local-only by default** — dashboard binds to `127.0.0.1` and reads local JSONL events.
 
 ## Installation and setup
 
@@ -118,7 +134,7 @@ pi install /home/rachit/ai_projects/executor-advisor
 For one-off local testing without installing the package:
 
 ```bash
-pi -e ./extensions/advisor/index.ts
+pi -e ./extensions/advisor/index.ts -e ./extensions/advisor-gate/index.ts
 ```
 
 For hot reload during development, place or symlink the extension under pi's auto-discovered extension directory and use `/reload` inside pi:
@@ -126,19 +142,24 @@ For hot reload during development, place or symlink the extension under pi's aut
 ```bash
 mkdir -p ~/.pi/agent/extensions
 ln -s /home/rachit/ai_projects/executor-advisor/extensions/advisor ~/.pi/agent/extensions/advisor
+ln -s /home/rachit/ai_projects/executor-advisor/extensions/advisor-gate ~/.pi/agent/extensions/advisor-gate
 ```
 
 Then run `/reload` in pi after edits.
 
 ## How it works
 
-1. You enable the extension and configure an advisor model.
-2. The extension adds an `advisor` tool to pi's active tools.
-3. For enabled sessions, it appends guidance telling the executor when to call the advisor.
-4. When the executor calls `advisor`, the extension serializes the current conversation branch.
-5. The serialized transcript is sent to the configured advisor model using pi's provider registry.
-6. The advisor returns concise private guidance to the executor.
-7. The executor remains responsible for all tool use and user-facing responses.
+1. You install the package, which loads two extensions:
+   - `extensions/advisor/index.ts` registers the private `advisor` tool.
+   - `extensions/advisor-gate/index.ts` logs advisor/executor events and serves the local dashboard/chat UI.
+2. You enable the extension and configure an advisor model.
+3. The advisor extension adds an `advisor` tool to pi's active tools.
+4. For enabled sessions, it appends guidance telling the executor when to call the advisor.
+5. When the executor calls `advisor`, the extension serializes the current conversation branch.
+6. The serialized transcript is sent to the configured advisor model using pi's provider registry.
+7. The advisor returns concise private guidance to the executor.
+8. The advisor-gate extension records local JSONL events and renders them in the dashboard/chat server.
+9. The executor remains responsible for all tool use and user-facing responses.
 
 The advisor cannot call tools and does not directly mutate files. It only returns text guidance.
 
@@ -154,6 +175,9 @@ The advisor cannot call tools and does not directly mutate files. It only return
 | `/advisor-words <n>` | Set target advisor response length. |
 | `/advisor-cadence <n\|off>` | Set recommended re-consult cadence for long multi-step tasks. This is prompt steering, not enforcement. |
 | `/advisor-reset` | Reset extension configuration to defaults. |
+| `/advisor-dashboard` | Start/show the local advisor dashboard and chat server. |
+| `/advisor-dashboard-stop` | Stop the local dashboard server. |
+| `/advisor-gate` | Show advisor gate/log/dashboard status. |
 
 ### Model specs
 
@@ -205,6 +229,26 @@ Default configuration:
 
 Most users only need the commands above. Advanced users may edit `advisor.json` directly while pi is not running.
 
+### Dashboard/chat server configuration
+
+The bundled advisor-gate extension starts a local-only HTTP server by default.
+
+| Environment variable | Default | Description |
+|---|---:|---|
+| `PI_ADVISOR_DASHBOARD` | enabled | Set to `0` to disable dashboard auto-start. |
+| `PI_ADVISOR_DASHBOARD_PORT` | `5000` | Local dashboard/chat port. |
+| `PI_ADVISOR_GATE_MODE` | `attempt` | Gate behavior: `off`, `log`, `attempt`, or `success`. |
+| `PI_ADVISOR_PG_DISABLE` | unset | Set to `1` to disable optional Postgres insert attempts. |
+| `PI_ADVISOR_PG_URL` | `postgres://localhost/advisor_habitat?sslmode=disable` | Optional observability Postgres URL. |
+
+Dashboard URLs:
+
+```text
+http://127.0.0.1:5000/       # event dashboard
+http://127.0.0.1:5000/chat   # chat-style executor/advisor view
+http://127.0.0.1:5000/events.json
+```
+
 ## Design inspiration
 
 This package is inspired by two advisor-style model collaboration ideas:
@@ -231,9 +275,20 @@ Important data-flow details:
 - The advisor model is called through pi's provider registry using your configured provider credentials.
 - This repository does **not** store API keys.
 - Runtime config lives in `~/.pi/agent/advisor.json`, not in this repo.
+- Advisor-gate event history lives in `~/.pi/agent/logs/advisor-gate.jsonl`, not in this repo.
 - API keys should remain in your normal pi/provider configuration, environment, or secret manager.
 
 Before using this extension with private code, choose an advisor model/provider whose data handling policy you trust.
+
+### Why is chat history empty on another computer?
+
+The advisor tool configuration and extension code can be installed from GitHub, but old chat history is local runtime data. The chat page reads:
+
+```text
+~/.pi/agent/logs/advisor-gate.jsonl
+```
+
+A fresh computer will show new conversations only after advisor-gate records events on that computer. If you want old history elsewhere, copy that JSONL file manually outside git after considering the privacy risk.
 
 ## What not to commit
 
@@ -244,6 +299,7 @@ Do not commit:
 - SSH keys
 - local pi config such as `advisor.json`
 - logs or session transcripts
+- `~/.pi/agent/logs/advisor-gate.jsonl`
 - database dumps containing private conversations
 
 The included `.gitignore` is configured to avoid common accidental secret and local artifact commits.
@@ -318,15 +374,19 @@ The extension truncates very large transcripts using `maxTranscriptChars`. Incre
 
 ```text
 .
+├── AGENT.md
+├── AGENTS.md
 ├── LICENSE
 ├── package.json
 ├── README.md
 └── extensions/
-    └── advisor/
+    ├── advisor/
+    │   └── index.ts
+    └── advisor-gate/
         └── index.ts
 ```
 
-This package currently ships one pi extension: `extensions/advisor/index.ts`.
+This package ships two pi extensions: the advisor tool and the advisor-gate dashboard/chat server.
 
 ## Package manifest
 
@@ -336,7 +396,10 @@ This package currently ships one pi extension: `extensions/advisor/index.ts`.
 {
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./extensions/advisor/index.ts"]
+    "extensions": [
+      "./extensions/advisor/index.ts",
+      "./extensions/advisor-gate/index.ts"
+    ]
   }
 }
 ```
@@ -350,10 +413,10 @@ git clone git@github.com:rbgit/pi-executor-advisor.git
 cd pi-executor-advisor
 ```
 
-Run the extension directly:
+Run the extensions directly:
 
 ```bash
-pi -e ./extensions/advisor/index.ts
+pi -e ./extensions/advisor/index.ts -e ./extensions/advisor-gate/index.ts
 ```
 
 Install locally as a pi package:
@@ -366,7 +429,7 @@ Useful inspection commands:
 
 ```bash
 find . -maxdepth 4 -type f -not -path './.git/*' -print
-grep -n "registerCommand\|registerTool" extensions/advisor/index.ts
+grep -n "registerCommand\|registerTool" extensions/advisor/index.ts extensions/advisor-gate/index.ts
 ```
 
 Pi loads TypeScript extensions through its runtime loader, so no compile step is required for normal local use.
