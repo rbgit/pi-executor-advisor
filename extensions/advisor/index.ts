@@ -7,14 +7,17 @@ import {
 	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
+	type ExtensionContext,
 	serializeConversation,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const TOOL_NAME = "advisor";
+
+type BriefMode = "off" | "auto" | "always";
 
 interface Config {
 	enabled: boolean;
@@ -25,6 +28,9 @@ interface Config {
 	maxTranscriptChars: number;
 	advisorCadence: number;
 	thinkingLevel: ModelThinkingLevel;
+	brief: BriefMode;
+	briefMaxWords: number;
+	briefTimeoutMs: number;
 }
 
 interface AdvisorDetails {
@@ -42,6 +48,7 @@ interface AdvisorDetails {
 	callsUsed: number;
 	maxUsesPerTask: number;
 	truncatedTranscript: boolean;
+	focus?: string;
 	error?: string;
 }
 
@@ -53,6 +60,9 @@ const DEFAULT_CONFIG: Config = {
 	maxTranscriptChars: 120_000,
 	advisorCadence: 5,
 	thinkingLevel: "off",
+	brief: "off",
+	briefMaxWords: 250,
+	briefTimeoutMs: 60_000,
 };
 
 const ADVISOR_SYSTEM = `You are a private advisor for a coding/research executor agent.
@@ -69,6 +79,22 @@ Return one concise response with:
 - WHEN_TO_RECONSULT: when the executor should call advisor again, if useful
 - STOP: say stop only if the executor should not proceed or should ask the user`;
 
+const BRIEF_SYSTEM = `You are a task router and prompt engineer for a coding/research executor agent backed by a smaller, cheaper model. The executor has full tool access (read files, run shell commands, edit files) but performs far better with precise, unambiguous instructions.
+
+Rewrite the raw user request into an execution brief the executor can follow reliably. Resolve ambiguity by stating the most reasonable interpretation as an explicit assumption. Never invent repository facts: anything not visible in the provided signals must appear as a verification step, not as a stated fact.
+
+Return exactly these sections:
+- GOAL: one sentence, the precise outcome.
+- SCOPE: what is in and out of scope.
+- ASSUMPTIONS: interpretations chosen where the request was ambiguous.
+- PLAN: numbered, small, independently verifiable steps.
+- FIRST_ACTIONS: exact first commands to run or files to read.
+- ACCEPTANCE_CHECKS: how the executor verifies the task is actually complete.
+- PITFALLS: likely mistakes for this specific task.
+- ADVISOR: when the executor should call the advisor tool during execution.
+
+No preamble, no closing remarks.`;
+
 function executorGuidance(config: Config) {
 	const cadence = config.advisorCadence > 0
 		? `\nFor long multi-step tasks, use advisor as a periodic verifier after roughly ${config.advisorCadence} meaningful tool/action observations, or sooner when evidence contradicts the plan.`
@@ -76,7 +102,7 @@ function executorGuidance(config: Config) {
 	return `
 
 Advisor strategy guidance:
-You have access to an \`advisor\` tool backed by a stronger reviewer model. It takes no parameters. When you call advisor(), the current transcript is forwarded and private guidance is returned.
+You have access to an \`advisor\` tool backed by a stronger reviewer model. When you call advisor, the current transcript is forwarded and private guidance is returned. You may pass an optional \`focus\` string to get a targeted answer to one specific question or decision.
 
 Call advisor before substantive work on complex tasks: after quick orientation reads, before writing/editing, before committing to an interpretation, when stuck, when changing approach, and before declaring a difficult task complete after making results durable.${cadence}
 
@@ -177,6 +203,110 @@ function formatModel(model?: { provider: string; model: string }) {
 	return model ? `${model.provider}/${model.model}` : "(none)";
 }
 
+const BRIEF_COMPLEXITY =
+	/(build|implement|create|write|add|modify|refactor|rewrite|migrate|upgrade|integrate|fix|debug|diagnose|failing|broken|regression|performance|bug|architecture|design|security|database|schema|migration|review|test)/i;
+
+function briefWorthy(prompt: string): boolean {
+	const trimmed = prompt.trim();
+	if (trimmed.length >= 240) return true;
+	return trimmed.length >= 40 && BRIEF_COMPLEXITY.test(trimmed);
+}
+
+function gatherRepoSignals(cwd: string): string {
+	const lines: string[] = [`Working directory: ${cwd}`];
+	try {
+		const entries = fs
+			.readdirSync(cwd, { withFileTypes: true })
+			.filter((entry) => entry.name !== ".git")
+			.slice(0, 60)
+			.map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name));
+		if (entries.length) lines.push(`Top-level entries: ${entries.join(", ")}`);
+	} catch {
+		// unreadable cwd: brief proceeds without listing
+	}
+	for (const readme of ["README.md", "README.rst", "README.txt", "README"]) {
+		try {
+			const text = fs.readFileSync(path.join(cwd, readme), "utf8").slice(0, 1500);
+			lines.push(`${readme} (excerpt):\n${text}`);
+			break;
+		} catch {
+			// try next candidate
+		}
+	}
+	return lines.join("\n\n");
+}
+
+function transcriptTail(ctx: ExtensionContext, maxChars: number): string {
+	const messages = ctx.sessionManager
+		.getBranch()
+		.map(entryToMessage)
+		.filter((message) => message !== undefined);
+	if (messages.length === 0) return "";
+	return serializeConversation(convertToLlm(messages)).slice(-maxChars);
+}
+
+type BriefResult =
+	| { ok: true; text: string; usage: AdvisorDetails["usage"] }
+	| { ok: false; error: string };
+
+async function generateBrief(prompt: string, config: Config, ctx: ExtensionContext): Promise<BriefResult> {
+	if (!config.advisor) return { ok: false, error: "not_configured" };
+	const advisorModel = ctx.modelRegistry.find(config.advisor.provider, config.advisor.model);
+	if (!advisorModel) return { ok: false, error: `advisor model not found: ${formatModel(config.advisor)}` };
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(advisorModel);
+	if (!auth.ok || !auth.apiKey) return { ok: false, error: auth.ok ? `no API key for ${modelLabel(advisorModel)}` : auth.error };
+
+	const tail = transcriptTail(ctx, 6000);
+	const briefPrompt = [
+		`<user_request>\n${prompt}\n</user_request>`,
+		`<executor>\n${ctx.model ? modelLabel(ctx.model) : "unknown"} (assume a smaller, faster model than you)\n</executor>`,
+		`<repo_signals>\n${gatherRepoSignals(ctx.cwd)}\n</repo_signals>`,
+		tail ? `<recent_transcript_tail>\n${tail}\n</recent_transcript_tail>` : "",
+		`Rewrite the user request into an execution brief for the executor now. Keep it under ${config.briefMaxWords} words.`,
+	]
+		.filter(Boolean)
+		.join("\n\n");
+
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), config.briefTimeoutMs);
+	try {
+		const response = await completeSimple(
+			advisorModel,
+			{
+				systemPrompt: BRIEF_SYSTEM,
+				messages: [{ role: "user", content: [{ type: "text", text: briefPrompt }], timestamp: Date.now() }],
+			},
+			{
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				signal: controller.signal,
+				maxTokens: config.maxOutputTokens,
+				reasoning: config.thinkingLevel === "off" ? undefined : config.thinkingLevel,
+			},
+		);
+		if (response.stopReason === "error") return { ok: false, error: response.errorMessage || "brief call failed" };
+		if (response.stopReason === "aborted") return { ok: false, error: `timed out after ${config.briefTimeoutMs}ms` };
+		const text = extractText(response);
+		if (!text) return { ok: false, error: "advisor returned an empty brief" };
+		return {
+			ok: true,
+			text,
+			usage: {
+				input: response.usage.input,
+				output: response.usage.output,
+				cacheRead: response.usage.cacheRead,
+				cacheWrite: response.usage.cacheWrite,
+				cost: response.usage.cost.total,
+				totalTokens: response.usage.totalTokens,
+			},
+		};
+	} catch (err) {
+		return { ok: false, error: err instanceof Error ? err.message : String(err) };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 function splitProviderModel(spec: string, providers: Set<string>): { provider: string; model: string } | undefined {
 	const slash = spec.indexOf("/");
 	if (slash <= 0) return undefined;
@@ -224,11 +354,11 @@ function resolveModel(ctx: { modelRegistry: ExtensionCommandContext["modelRegist
 	return { ok: false, error: `Ambiguous model spec ${normalized}: ${fuzzy.map(modelLabel).slice(0, 8).join(", ")}` };
 }
 
-function parsePairArgs(args: string): { executor?: string; advisor?: string; max?: number; words?: number; errors: string[] } {
-	const out: { executor?: string; advisor?: string; max?: number; words?: number; errors: string[] } = { errors: [] };
+function parsePairArgs(args: string): { executor?: string; advisor?: string; max?: number; words?: number; brief?: BriefMode; errors: string[] } {
+	const out: { executor?: string; advisor?: string; max?: number; words?: number; brief?: BriefMode; errors: string[] } = { errors: [] };
 	const positional: string[] = [];
 	for (const token of args.trim().split(/\s+/).filter(Boolean)) {
-		const match = token.match(/^(executor|exec|advisor|adv|max|uses|words):(.+)$/i);
+		const match = token.match(/^(executor|exec|advisor|adv|max|uses|words|brief):(.+)$/i);
 		if (!match) {
 			positional.push(token);
 			continue;
@@ -239,6 +369,11 @@ function parsePairArgs(args: string): { executor?: string; advisor?: string; max
 		else if (key === "advisor" || key === "adv") out.advisor = value;
 		else if (key === "max" || key === "uses") out.max = Number(value);
 		else if (key === "words") out.words = Number(value);
+		else if (key === "brief") {
+			const mode = value.toLowerCase();
+			if (mode === "off" || mode === "auto" || mode === "always") out.brief = mode;
+			else out.errors.push("brief must be off, auto, or always");
+		}
 	}
 	if (!out.executor && positional[0]) out.executor = positional[0];
 	if (!out.advisor && positional[1]) out.advisor = positional[1];
@@ -255,6 +390,7 @@ function statusText(config: Config, executor?: Model<Api>) {
 		`max uses/task: ${config.maxUsesPerTask}`,
 		`target words: ${config.maxWords}`,
 		`advisor cadence: ${config.advisorCadence > 0 ? `~${config.advisorCadence} meaningful steps` : "off"}`,
+		`task brief: ${config.brief}`,
 		`config: ${configPath()}`,
 	].join("\n");
 }
@@ -362,6 +498,24 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("advisor-brief", {
+		description: "Set advisor task brief mode (advisor rewrites the user prompt into an execution brief): /advisor-brief <off|auto|always>",
+		handler: async (args, ctx) => {
+			const raw = args.trim().toLowerCase();
+			if (!raw) {
+				ctx.ui.notify(`Advisor brief mode: ${config.brief}`, "info");
+				return;
+			}
+			if (raw !== "off" && raw !== "auto" && raw !== "always") {
+				ctx.ui.notify("Usage: /advisor-brief <off|auto|always>", "error");
+				return;
+			}
+			persist({ ...config, brief: raw });
+			updateStatus(ctx);
+			ctx.ui.notify(`Advisor brief mode: ${raw}`, "info");
+		},
+	});
+
 	pi.registerCommand("advisor-reset", {
 		description: "Reset advisor extension configuration",
 		handler: async (_args, ctx) => {
@@ -405,15 +559,36 @@ export default function (pi: ExtensionAPI) {
 				advisor: { provider: advisor.model.provider, model: advisor.model.id, spec: parsed.advisor },
 				maxUsesPerTask: parsed.max ?? config.maxUsesPerTask,
 				maxWords: parsed.words ?? config.maxWords,
+				brief: parsed.brief ?? config.brief,
 			});
 			updateStatus(ctx);
 			ctx.ui.notify(`Executor: ${modelLabel(executor.model)}\nAdvisor: ${modelLabel(advisor.model)}`, "info");
 		},
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (!config.enabled || !config.advisor) return;
-		return { systemPrompt: `${executorGuidance(config)}\n\n${event.systemPrompt}` };
+		const systemPrompt = `${executorGuidance(config)}\n\n${event.systemPrompt}`;
+		const wantBrief = config.brief === "always" || (config.brief === "auto" && briefWorthy(event.prompt ?? ""));
+		if (!wantBrief) return { systemPrompt };
+
+		if (ctx.hasUI) ctx.ui.notify(`Advisor brief: consulting ${formatModel(config.advisor)}...`, "info");
+		const brief = await generateBrief(event.prompt ?? "", config, ctx);
+		if (!brief.ok) {
+			if (ctx.hasUI) ctx.ui.notify(`Advisor brief skipped: ${brief.error}`, "warning");
+			return { systemPrompt };
+		}
+
+		const content = `<advisor_brief advisor="${formatModel(config.advisor)}">\n${brief.text}\n</advisor_brief>\n\nThis execution brief was generated by the advisor model from the user's request before execution started. Follow its plan, first actions, and acceptance checks unless tool evidence contradicts them. The user's original request remains authoritative for intent.`;
+		return {
+			systemPrompt,
+			message: {
+				customType: "advisor-brief",
+				content,
+				display: true,
+				details: { kind: "brief", version: VERSION, advisor: config.advisor, usage: brief.usage },
+			},
+		};
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -424,15 +599,21 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: "Advisor",
-		description: "Consult the configured stronger advisor model for private strategic guidance. Takes no parameters. The advisor receives a serialized transcript, cannot call tools, and does not produce user-facing output.",
-		promptSnippet: "Consult a stronger model for private plan/correction guidance; no parameters.",
+		description: "Consult the configured stronger advisor model for private strategic guidance. The advisor receives a serialized transcript plus an optional focus question, cannot call tools, and does not produce user-facing output.",
+		promptSnippet: "Consult a stronger model for private plan/correction guidance; optional focus question.",
 		promptGuidelines: [
 			"Use advisor before substantive work on complex coding/research tasks, after quick orientation, when stuck, before changing approach, and before declaring difficult work complete.",
 			"Use advisor as a verifier over the current trajectory: let it critique concrete tool evidence, partial plans, and implementation attempts.",
-			"The advisor tool takes no parameters; do not pass text or questions to advisor.",
+			"Pass `focus` with one targeted question when you need a specific decision checked (for example: is this migration order safe?); omit it for a general trajectory review.",
 		],
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, signal, onUpdate, ctx) {
+		parameters: Type.Object({
+			focus: Type.Optional(
+				Type.String({
+					description: "Optional targeted question or decision for the advisor to address first. Omit for a general review of the current trajectory.",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const branch = ctx.sessionManager.getBranch();
 			const callsUsed = countAdvisorCallsThisTask(branch);
 
@@ -472,8 +653,9 @@ export default function (pi: ExtensionAPI) {
 			const llmMessages = convertToLlm(messages);
 			const serialized = serializeConversation(llmMessages);
 			const truncated = truncateTranscript(serialized, config.maxTranscriptChars);
+			const focus = typeof params.focus === "string" ? params.focus.trim().slice(0, 2000) : "";
 
-			const advisorPrompt = `<executor_context>\nExecutor model: ${ctx.model ? modelLabel(ctx.model) : "unknown"}\nWorking directory: ${ctx.cwd}\nAdvisor call: ${callsUsed + 1}/${config.maxUsesPerTask}\nRecommended re-consult cadence: ${config.advisorCadence > 0 ? `~${config.advisorCadence} meaningful executor observations` : "off"}\nTranscript truncated: ${truncated.truncated ? "yes" : "no"}\n</executor_context>\n\n<transcript>\n${truncated.text}\n</transcript>\n\nGive private guidance to the executor now. Keep it under ${config.maxWords} words. Be concrete, evidence-grounded, and verifier-oriented when the transcript contains an initial attempt or tool observations.`;
+			const advisorPrompt = `<executor_context>\nExecutor model: ${ctx.model ? modelLabel(ctx.model) : "unknown"}\nWorking directory: ${ctx.cwd}\nAdvisor call: ${callsUsed + 1}/${config.maxUsesPerTask}\nRecommended re-consult cadence: ${config.advisorCadence > 0 ? `~${config.advisorCadence} meaningful executor observations` : "off"}\nTranscript truncated: ${truncated.truncated ? "yes" : "no"}\n</executor_context>\n${focus ? `\n<executor_focus>\n${focus}\n</executor_focus>\n` : ""}\n<transcript>\n${truncated.text}\n</transcript>\n\nGive private guidance to the executor now. Keep it under ${config.maxWords} words. Be concrete, evidence-grounded, and verifier-oriented when the transcript contains an initial attempt or tool observations.${focus ? " Address the executor's focus question first, then verify the broader trajectory." : ""}`;
 
 			const advisorMessages: Message[] = [
 				{
@@ -527,11 +709,15 @@ export default function (pi: ExtensionAPI) {
 					callsUsed: callsUsed + 1,
 					maxUsesPerTask: config.maxUsesPerTask,
 					truncatedTranscript: truncated.truncated,
+					focus: focus || undefined,
 				} satisfies AdvisorDetails,
 			};
 		},
-		renderCall(_args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("advisor")) + theme.fg("muted", ` ${formatModel(config.advisor)}`), 0, 0);
+		renderCall(args, theme) {
+			const focus = typeof (args as { focus?: string } | undefined)?.focus === "string" ? (args as { focus: string }).focus : "";
+			let out = theme.fg("toolTitle", theme.bold("advisor")) + theme.fg("muted", ` ${formatModel(config.advisor)}`);
+			if (focus) out += theme.fg("dim", ` ${focus.length > 80 ? `${focus.slice(0, 77)}...` : focus}`);
+			return new Text(out, 0, 0);
 		},
 		renderResult(result, { expanded }, theme) {
 			const details = result.details as AdvisorDetails | undefined;

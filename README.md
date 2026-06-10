@@ -67,6 +67,12 @@ Or set both executor and advisor together:
 /advisor-pair executor:kimi-k2.5 advisor:gpt-5.5 max:3 words:120
 ```
 
+Let the advisor rewrite each complex user prompt into an execution brief before the cheap executor starts:
+
+```text
+/advisor-brief auto
+```
+
 Check status:
 
 ```text
@@ -94,6 +100,8 @@ Once enabled, the executor can call the `advisor` tool during coding/research ta
 - **Provider agnostic** — works with any models registered in pi, not only Claude-native advisor pairs.
 - **Private guidance** — advisor output is returned to the executor as tool output, not directly to the user.
 - **Transcript-aware advice** — sends the current branch transcript to the advisor model.
+- **Task briefs (prompt routing)** — the advisor can rewrite each user prompt into a structured execution brief (goal, plan, first actions, acceptance checks, pitfalls) injected before a cheap/fast executor starts work.
+- **Focused questions** — the executor can pass an optional `focus` question to the advisor for a targeted decision check instead of a general review.
 - **Verifier-oriented prompting** — when a transcript already contains a plan, attempt, or tool observations, the advisor is prompted to critique concrete evidence instead of giving generic tips.
 - **Configurable limits** — cap advisor calls per user task and target response length.
 - **Configurable advising cadence** — nudge the executor to re-consult the advisor periodically on long multi-step tasks.
@@ -163,6 +171,39 @@ Then run `/reload` in pi after edits.
 
 The advisor cannot call tools and does not directly mutate files. It only returns text guidance.
 
+## Task briefs: routing prompts through the advisor
+
+Cheap/fast executors (small open-weight models, mini code models, diffusion LLMs) execute well but plan poorly from vague prompts. With `/advisor-brief auto`, the advisor model intercepts each complex user prompt **before execution starts** and rewrites it into a structured execution brief:
+
+- **GOAL** — the precise outcome, one sentence
+- **SCOPE** — what is in and out of scope
+- **ASSUMPTIONS** — explicit interpretations of ambiguous wording
+- **PLAN** — numbered, small, independently verifiable steps
+- **FIRST_ACTIONS** — exact commands to run or files to read first
+- **ACCEPTANCE_CHECKS** — how the executor verifies completion
+- **PITFALLS** — likely mistakes for this specific task
+- **ADVISOR** — when to re-consult the advisor during execution
+
+The brief is grounded in lightweight repo signals (top-level listing, README excerpt) and the tail of the current conversation, then injected into the session as a visible message the executor follows. The raw user request remains authoritative for intent.
+
+Modes:
+
+- `off` (default) — never generate briefs.
+- `auto` — brief only prompts that look complex (length or implementation/debugging/architecture keywords). Trivial prompts skip the extra advisor call.
+- `always` — brief every prompt.
+
+Brief generation is best-effort: on advisor error or timeout (`briefTimeoutMs`, default 60s) the task starts normally without a brief.
+
+```text
+/advisor-pair executor:kimi-k2.5 advisor:gpt-5.5 brief:auto
+```
+
+During execution the executor can also pass a targeted question to the advisor:
+
+```text
+advisor(focus: "Is applying the schema migration before the backfill safe here?")
+```
+
 ## Commands
 
 | Command | Description |
@@ -170,10 +211,11 @@ The advisor cannot call tools and does not directly mutate files. It only return
 | `/advisor-on <advisor-model>` | Enable advisor mode and configure the advisor model. |
 | `/advisor-off` | Disable advisor prompt steering and remove the advisor tool from active tools. |
 | `/advisor-status` | Show current executor/advisor configuration. |
-| `/advisor-pair executor:<model> advisor:<model> [max:<n>] [words:<n>]` | Set executor and advisor models together. |
+| `/advisor-pair executor:<model> advisor:<model> [max:<n>] [words:<n>] [brief:<mode>]` | Set executor and advisor models together. |
 | `/advisor-max <n>` | Set maximum advisor calls per user task. |
 | `/advisor-words <n>` | Set target advisor response length. |
 | `/advisor-cadence <n\|off>` | Set recommended re-consult cadence for long multi-step tasks. This is prompt steering, not enforcement. |
+| `/advisor-brief <off\|auto\|always>` | Have the advisor rewrite user prompts into execution briefs before the executor starts. `auto` briefs only complex-looking prompts. |
 | `/advisor-reset` | Reset extension configuration to defaults. |
 | `/advisor-dashboard` | Start/show the local advisor dashboard and chat server. |
 | `/advisor-dashboard-stop` | Stop the local dashboard server. |
@@ -223,7 +265,10 @@ Default configuration:
   "maxOutputTokens": 2048,
   "maxTranscriptChars": 120000,
   "advisorCadence": 5,
-  "thinkingLevel": "off"
+  "thinkingLevel": "off",
+  "brief": "off",
+  "briefMaxWords": 250,
+  "briefTimeoutMs": 60000
 }
 ```
 
