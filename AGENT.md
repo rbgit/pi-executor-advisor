@@ -2,8 +2,10 @@
 
 This repo is a pi package. It should install two extensions together:
 
-1. `extensions/advisor/index.ts` — registers the private `advisor` tool and advisor config commands.
-2. `extensions/advisor-gate/index.ts` — logs advisor/executor events and serves the local dashboard/chat server.
+1. `extensions/advisor/index.ts` — registers the private `advisor` tool, task briefs, completion judge, per-task routing, escalation, budget, and advisor config commands.
+2. `extensions/advisor-gate/index.ts` — logs advisor/executor events, enforces the advisor gate, and serves the local dashboard/chat server.
+
+Both extensions import `extensions/shared/classify.ts` (the shared task classifier). That file is **required at runtime** — never remove or prune it. Packaging has been verified: git installs clone the full repo, local installs reference the directory in place, and `npm pack` includes it.
 
 ## Install on a new machine
 
@@ -30,7 +32,7 @@ Inside pi:
 or set both executor and advisor:
 
 ```text
-/advisor-pair executor:<model> advisor:<model> [max:<n>] [words:<n>]
+/advisor-pair executor:<model> advisor:<model> [max:<n>] [words:<n>] [brief:<mode>] [budget:<usd>]
 ```
 
 Check config:
@@ -38,6 +40,24 @@ Check config:
 ```text
 /advisor-status
 ```
+
+Optional layers (all default off; see README for details):
+
+```text
+/advisor-brief <off|auto|always>          # advisor rewrites user prompts into execution briefs
+/advisor-judge <off|auto|always> [retries:<n>]  # PASS/FAIL verdict on finished tasks, bounded fix rounds
+/advisor-route simple:<model> complex:<model>   # per-task executor model routing ( /advisor-route off )
+/advisor-escalate <model|off>             # stronger advisor for stuck/failed tasks
+/advisor-budget <usd|off>                 # per-task USD cap across brief + advisor calls + judge
+/advisor-cadence <n|off>                  # re-consult steering for long tasks
+/advisor-max <n>  /advisor-words <n>      # advisor call cap and response length
+```
+
+Config persists in `~/.pi/agent/advisor.json` (or `$PI_CODING_AGENT_DIR/advisor.json`). Key fields: `brief`, `briefMaxWords`, `briefTimeoutMs`, `judge`, `judgeMaxRetries`, `routing`, `escalation`, `maxCostPerTask`.
+
+Budget caveat: spend is summed from recorded usage costs; models without pricing metadata report zero cost and are invisible to the budget.
+
+Privacy note for agents: briefs, advisor calls, and judge calls send the transcript **plus `git status`/`git diff HEAD` output** to the configured advisor (and escalation) provider. Do not enable these against repositories whose uncommitted changes may contain secrets unless the user has accepted that provider.
 
 ## Dashboard and chat server
 
@@ -125,13 +145,24 @@ grep -n "registerCommand\|registerTool" extensions/advisor/index.ts extensions/a
 git diff --check
 npm pack --dry-run
 rm -f pi-executor-advisor-*.tgz
-find . -maxdepth 4 -type f | grep -Ei 'env|key|pem|secret|token|credential|advisor\.json|log|jsonl|db' || true
+find . -maxdepth 4 -type f | grep -Ei 'env|key|pem|secret|token|credential|advisor\.json|jsonl|db' || true
 ```
 
-Expected package files include:
+Typecheck against the real pi types (no compile step is needed for normal use; this is for verification only):
+
+```bash
+mkdir -p /tmp/pi-typecheck && cd /tmp/pi-typecheck && npm init -y >/dev/null
+npm i -D typescript @earendil-works/pi-coding-agent @earendil-works/pi-ai @earendil-works/pi-agent-core @earendil-works/pi-tui typebox
+cp -r <repo>/extensions . && npx tsc --noEmit --strict --target ES2022 --module ESNext \
+  --moduleResolution bundler --skipLibCheck --allowImportingTsExtensions extensions/*/index.ts
+```
+
+Expected package files (all required; `npm pack --dry-run` must list every one):
 
 - `LICENSE`
 - `README.md`
+- `AGENT.md` / `AGENTS.md`
 - `package.json`
 - `extensions/advisor/index.ts`
 - `extensions/advisor-gate/index.ts`
+- `extensions/shared/classify.ts` — shared classifier imported by both extensions; removing it breaks both at load time.
