@@ -73,6 +73,14 @@ Let the advisor rewrite each complex user prompt into an execution brief before 
 /advisor-brief auto
 ```
 
+Turn on the completion judge (advisor verdicts each finished task, with one automatic fix round on FAIL), per-task model routing, and an escalation advisor:
+
+```text
+/advisor-judge auto
+/advisor-route simple:haiku complex:kimi-k2.5
+/advisor-escalate openai/gpt-5.5
+```
+
 Check status:
 
 ```text
@@ -102,6 +110,11 @@ Once enabled, the executor can call the `advisor` tool during coding/research ta
 - **Transcript-aware advice** — sends the current branch transcript to the advisor model.
 - **Task briefs (prompt routing)** — the advisor can rewrite each user prompt into a structured execution brief (goal, plan, first actions, acceptance checks, pitfalls) injected before a cheap/fast executor starts work.
 - **Focused questions** — the executor can pass an optional `focus` question to the advisor for a targeted decision check instead of a general review.
+- **Completion judge** — the advisor can grade each finished task PASS/FAIL against the request and the brief's acceptance checks, automatically sending REQUIRED_FIXES back to the executor for a bounded number of retry rounds.
+- **Per-task model routing** — route simple tasks to a cheaper executor and complex tasks to a stronger one, decided per prompt by the shared task classifier.
+- **Escalation ladder** — after a judge failure, advisor STOP advice, or repeated consults in one task, advisor calls automatically escalate to a configured stronger model.
+- **Diff-aware advice** — advisor, brief, and judge prompts include `git status`/`git diff` so critiques target the actual changes, not just narrated ones.
+- **Learns from local history** — briefs mine the local advisor-gate event log for this repo's past blocked mutations and failed verdicts to sharpen PITFALLS and ACCEPTANCE_CHECKS.
 - **Verifier-oriented prompting** — when a transcript already contains a plan, attempt, or tool observations, the advisor is prompted to critique concrete evidence instead of giving generic tips.
 - **Configurable limits** — cap advisor calls per user task and target response length.
 - **Configurable advising cadence** — nudge the executor to re-consult the advisor periodically on long multi-step tasks.
@@ -204,6 +217,33 @@ During execution the executor can also pass a targeted question to the advisor:
 advisor(focus: "Is applying the schema migration before the backfill safe here?")
 ```
 
+Briefs are additionally grounded in the workspace `git status`/`git diff` and in this repo's recent failure history mined from the local advisor-gate event log.
+
+## Completion judge
+
+With `/advisor-judge auto` (or `always`), the advisor grades each finished task:
+
+1. When the agent loop ends, the advisor receives the user request, the execution brief (if one was generated), the workspace diff, and the transcript.
+2. It returns `VERDICT: PASS` or `VERDICT: FAIL` with evidence-grounded reasons.
+3. On FAIL, the judge's REQUIRED_FIXES are sent back to the executor as a follow-up message that triggers a new fix round, up to `judgeMaxRetries` rounds (default 1). After that, failures are only reported, never looped.
+4. Verdicts are appended to the local advisor-gate event log, which future briefs mine for past failure modes.
+
+`auto` judges only tasks the classifier marks as advisor-worthy; `always` judges every task. Aborted or errored runs are never judged. Set retries with `/advisor-judge auto retries:2`.
+
+## Per-task model routing
+
+`/advisor-route simple:<model> complex:<model>` switches the executor model per user prompt: prompts the shared classifier marks as advisor-worthy (implementation, debugging, architecture/security, data risk, large prompts) go to the `complex` model; everything else goes to `simple`. Either tier may be omitted, in which case the current model is kept for that tier. Disable with `/advisor-route off`.
+
+## Escalation ladder
+
+`/advisor-escalate <model>` configures a stronger fallback advisor. Advisor calls (and re-judging after a failed fix round) automatically use it when any of these hold for the current task:
+
+- a completion judge FAIL already occurred,
+- earlier advisor advice contained a STOP section,
+- this is the third or later advisor call.
+
+Escalated calls are marked in the tool output and recorded in the result details.
+
 ## Commands
 
 | Command | Description |
@@ -216,6 +256,9 @@ advisor(focus: "Is applying the schema migration before the backfill safe here?"
 | `/advisor-words <n>` | Set target advisor response length. |
 | `/advisor-cadence <n\|off>` | Set recommended re-consult cadence for long multi-step tasks. This is prompt steering, not enforcement. |
 | `/advisor-brief <off\|auto\|always>` | Have the advisor rewrite user prompts into execution briefs before the executor starts. `auto` briefs only complex-looking prompts. |
+| `/advisor-judge <off\|auto\|always> [retries:<n>]` | Grade finished tasks PASS/FAIL and send REQUIRED_FIXES back to the executor on FAIL. |
+| `/advisor-route simple:<model> complex:<model> \| off` | Route the executor model per task complexity. |
+| `/advisor-escalate <model\|off>` | Configure a stronger escalation advisor for stuck or failed tasks. |
 | `/advisor-reset` | Reset extension configuration to defaults. |
 | `/advisor-dashboard` | Start/show the local advisor dashboard and chat server. |
 | `/advisor-dashboard-stop` | Stop the local dashboard server. |
@@ -268,9 +311,14 @@ Default configuration:
   "thinkingLevel": "off",
   "brief": "off",
   "briefMaxWords": 250,
-  "briefTimeoutMs": 60000
+  "briefTimeoutMs": 60000,
+  "judge": "off",
+  "judgeMaxRetries": 1,
+  "routing": { "enabled": false }
 }
 ```
+
+Optional model references (`routing.simple`, `routing.complex`, `escalation`) are set by the commands above and stored as `{ "provider": ..., "model": ..., "spec": ... }`.
 
 Most users only need the commands above. Advanced users may edit `advisor.json` directly while pi is not running.
 
@@ -427,8 +475,10 @@ The extension truncates very large transcripts using `maxTranscriptChars`. Incre
 └── extensions/
     ├── advisor/
     │   └── index.ts
-    └── advisor-gate/
-        └── index.ts
+    ├── advisor-gate/
+    │   └── index.ts
+    └── shared/
+        └── classify.ts
 ```
 
 This package ships two pi extensions: the advisor tool and the advisor-gate dashboard/chat server.

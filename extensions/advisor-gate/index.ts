@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { classifyTask } from "../shared/classify.ts";
 
 type GateMode = "off" | "log" | "attempt" | "success";
 
@@ -34,21 +35,6 @@ function envMode(): GateMode {
   const raw = (process.env.PI_ADVISOR_GATE_MODE ?? "attempt").toLowerCase();
   if (raw === "off" || raw === "log" || raw === "attempt" || raw === "success") return raw;
   return "attempt";
-}
-
-function classify(prompt: string): { required: boolean; reasons: string[] } {
-  const p = prompt.toLowerCase();
-  const reasons: string[] = [];
-  const checks: Array<[RegExp, string]> = [
-    [/(build|implement|create|write|add|modify|refactor|rewrite|migrate|upgrade|integrate)/, "implementation or code change"],
-    [/(debug|diagnose|failing|broken|regression|performance|bug)/, "debugging or regression"],
-    [/(architecture|design|security|auth|permission|policy|enforce|gate|production)/, "architecture/security/policy"],
-    [/(database|schema|migration|postgres|sql|delete|destructive)/, "data/destructive-risk"],
-    [/(extension|provider|tool|agent|executor|advisor|model|habitat|absurd)/, "agent/tooling infrastructure"],
-  ];
-  for (const [re, reason] of checks) if (re.test(p)) reasons.push(reason);
-  if (prompt.length > 500) reasons.push("large/ambiguous request");
-  return { required: reasons.length > 0, reasons: [...new Set(reasons)] };
 }
 
 function isAdvisorTool(toolName: string): boolean {
@@ -102,10 +88,6 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>'"]/g, (ch) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "'":"&#39;", '"':"&quot;" }[ch]!));
 }
 
-function sqlLit(s: string): string {
-  return "'" + s.replace(/'/g, "''") + "'";
-}
-
 export default function advisorGate(pi: ExtensionAPI) {
   let mode: GateMode = envMode();
   let current: RunState | undefined;
@@ -125,41 +107,70 @@ export default function advisorGate(pi: ExtensionAPI) {
     });
   }
 
+  const pgQueue: Record<string, unknown>[] = [];
+  let pgTimer: NodeJS.Timeout | undefined;
+
+  // Rows arrive as a single psql variable; :'rows' is quoted by psql itself,
+  // so no SQL is ever built from event content.
+  const PG_INSERT_SQL = `insert into advisor_observability.events (
+    ts,event,mode,run_id,tool_call_id,tool_name,status,required,reasons,prompt,cwd,
+    executor_provider,executor_model,advisor_provider,advisor_model,input_tokens,output_tokens,total_tokens,cost_total,duration_ms,content_chars,content_preview,data
+  )
+  select
+    coalesce((r->>'ts')::timestamptz, now()),
+    coalesce(r->>'event', 'unknown'),
+    r->>'mode',
+    r->>'runId',
+    r->>'toolCallId',
+    r->>'toolName',
+    r->>'status',
+    (r->>'required')::boolean,
+    case when jsonb_typeof(r->'reasons') = 'array' then array(select jsonb_array_elements_text(r->'reasons')) end,
+    r->>'prompt',
+    r->>'cwd',
+    r->>'executorProvider',
+    r->>'executorModel',
+    r->>'advisorProvider',
+    r->>'advisorModel',
+    (r->>'inputTokens')::numeric,
+    (r->>'outputTokens')::numeric,
+    (r->>'totalTokens')::numeric,
+    (r->>'costTotal')::numeric,
+    (r->>'durationMs')::numeric,
+    (r->>'contentChars')::numeric,
+    r->>'contentPreview',
+    r
+  from jsonb_array_elements((:'rows')::jsonb) as r;`;
+
+  function flushPostgres() {
+    if (pgTimer) {
+      clearTimeout(pgTimer);
+      pgTimer = undefined;
+    }
+    if (pgQueue.length === 0) return;
+    const rows = pgQueue.splice(0, pgQueue.length);
+    const child = spawn(
+      "psql",
+      [pgUrl, "-q", "-v", "ON_ERROR_STOP=1", "-v", `rows=${JSON.stringify(rows)}`],
+      { stdio: ["pipe", "ignore", "ignore"], detached: true },
+    );
+    child.on("error", () => {});
+    child.stdin?.write(PG_INSERT_SQL);
+    child.stdin?.end();
+    child.unref();
+  }
+
   function insertPostgres(row: Record<string, unknown>) {
     if (process.env.PI_ADVISOR_PG_DISABLE === "1") return;
-    const json = JSON.stringify(row);
-    const data: any = row;
-    const reasons = Array.isArray(data.reasons) ? `ARRAY[${data.reasons.map((r: string) => sqlLit(r)).join(",")}]::text[]` : "NULL";
-    const sql = `insert into advisor_observability.events (
-      ts,event,mode,run_id,tool_call_id,tool_name,status,required,reasons,prompt,cwd,
-      executor_provider,executor_model,advisor_provider,advisor_model,input_tokens,output_tokens,total_tokens,cost_total,duration_ms,content_chars,content_preview,data
-    ) values (
-      ${sqlLit(String(data.ts ?? now()))}::timestamptz,
-      ${sqlLit(String(data.event ?? "unknown"))},
-      ${data.mode ? sqlLit(String(data.mode)) : "NULL"},
-      ${data.runId ? sqlLit(String(data.runId)) : "NULL"},
-      ${data.toolCallId ? sqlLit(String(data.toolCallId)) : "NULL"},
-      ${data.toolName ? sqlLit(String(data.toolName)) : "NULL"},
-      ${data.status ? sqlLit(String(data.status)) : "NULL"},
-      ${typeof data.required === "boolean" ? String(data.required) : "NULL"},
-      ${reasons},
-      ${data.prompt ? sqlLit(String(data.prompt)) : "NULL"},
-      ${data.cwd ? sqlLit(String(data.cwd)) : "NULL"},
-      ${data.executorProvider ? sqlLit(String(data.executorProvider)) : "NULL"},
-      ${data.executorModel ? sqlLit(String(data.executorModel)) : "NULL"},
-      ${data.advisorProvider ? sqlLit(String(data.advisorProvider)) : "NULL"},
-      ${data.advisorModel ? sqlLit(String(data.advisorModel)) : "NULL"},
-      ${Number.isFinite(data.inputTokens) ? Number(data.inputTokens) : "NULL"},
-      ${Number.isFinite(data.outputTokens) ? Number(data.outputTokens) : "NULL"},
-      ${Number.isFinite(data.totalTokens) ? Number(data.totalTokens) : "NULL"},
-      ${Number.isFinite(data.costTotal) ? Number(data.costTotal) : "NULL"},
-      ${Number.isFinite(data.durationMs) ? Number(data.durationMs) : "NULL"},
-      ${Number.isFinite(data.contentChars) ? Number(data.contentChars) : "NULL"},
-      ${data.contentPreview ? sqlLit(String(data.contentPreview)) : "NULL"},
-      ${sqlLit(json)}::jsonb
-    );`;
-    const child = spawn("psql", [pgUrl, "-q", "-v", "ON_ERROR_STOP=1", "-c", sql], { stdio: "ignore", detached: true });
-    child.unref();
+    pgQueue.push(row);
+    if (pgQueue.length >= 20) {
+      flushPostgres();
+      return;
+    }
+    if (!pgTimer) {
+      pgTimer = setTimeout(flushPostgres, 3000);
+      pgTimer.unref?.();
+    }
   }
 
   function log(event: string, data: Record<string, unknown>, ctx?: ExtensionContext) {
@@ -752,7 +763,7 @@ ${navHtml("chat")}
 
   pi.on("before_agent_start", async (event, ctx) => {
     mode = envMode();
-    const { required, reasons } = classify(event.prompt ?? "");
+    const { required, reasons } = classifyTask(event.prompt ?? "");
     current = { runId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: event.prompt ?? "", required, reasons, startedAt: now(), advisorAttempted: false, advisorSucceeded: false, advisorFailed: false, advisorToolCallIds: [] };
     log("run_start", { required, reasons, prompt: event.prompt }, ctx);
     if (!required || mode === "off") return undefined;
@@ -794,5 +805,11 @@ ${navHtml("chat")}
     if (!current) return undefined;
     log("run_end", { required: current.required, advisorAttempted: current.advisorAttempted, advisorSucceeded: current.advisorSucceeded, advisorFailed: current.advisorFailed, satisfied: satisfied(), reasons: current.reasons }, ctx);
     if (current.required && !satisfied() && ctx.hasUI) ctx.ui.notify(`Advisor gate not satisfied. mode=${mode}; attempted=${current.advisorAttempted}; succeeded=${current.advisorSucceeded}. Log: ${logPath}`, "warning");
+    flushPostgres();
+  });
+
+  pi.on("session_shutdown", async () => {
+    flushPostgres();
+    dashboard?.close();
   });
 }
