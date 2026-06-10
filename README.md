@@ -251,7 +251,7 @@ Escalated calls are marked in the tool output and recorded in the result details
 | `/advisor-on <advisor-model>` | Enable advisor mode and configure the advisor model. |
 | `/advisor-off` | Disable advisor prompt steering and remove the advisor tool from active tools. |
 | `/advisor-status` | Show current executor/advisor configuration. |
-| `/advisor-pair executor:<model> advisor:<model> [max:<n>] [words:<n>] [brief:<mode>]` | Set executor and advisor models together. |
+| `/advisor-pair executor:<model> advisor:<model> [max:<n>] [words:<n>] [brief:<mode>] [budget:<usd>]` | Set executor and advisor models together. |
 | `/advisor-max <n>` | Set maximum advisor calls per user task. |
 | `/advisor-words <n>` | Set target advisor response length. |
 | `/advisor-cadence <n\|off>` | Set recommended re-consult cadence for long multi-step tasks. This is prompt steering, not enforcement. |
@@ -259,6 +259,7 @@ Escalated calls are marked in the tool output and recorded in the result details
 | `/advisor-judge <off\|auto\|always> [retries:<n>]` | Grade finished tasks PASS/FAIL and send REQUIRED_FIXES back to the executor on FAIL. |
 | `/advisor-route simple:<model> complex:<model> \| off` | Route the executor model per task complexity. |
 | `/advisor-escalate <model\|off>` | Configure a stronger escalation advisor for stuck or failed tasks. |
+| `/advisor-budget <usd\|off>` | Cap total advisor spend per user task across brief, advisor calls, and judge. |
 | `/advisor-reset` | Reset extension configuration to defaults. |
 | `/advisor-dashboard` | Start/show the local advisor dashboard and chat server. |
 | `/advisor-dashboard-stop` | Stop the local dashboard server. |
@@ -314,9 +315,12 @@ Default configuration:
   "briefTimeoutMs": 60000,
   "judge": "off",
   "judgeMaxRetries": 1,
-  "routing": { "enabled": false }
+  "routing": { "enabled": false },
+  "maxCostPerTask": 0
 }
 ```
+
+`maxCostPerTask` (USD, `0` = off) caps the advisor layer per user task: once recorded brief + advisor + judge costs reach the cap, further advisor calls return a budget notice and the judge is skipped. Spend is summed from recorded usage costs, so models without pricing metadata (cost `0`) are invisible to the budget.
 
 Optional model references (`routing.simple`, `routing.complex`, `escalation`) are set by the commands above and stored as `{ "provider": ..., "model": ..., "spec": ... }`.
 

@@ -15,7 +15,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { briefWorthy, classifyTask } from "../shared/classify.ts";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const TOOL_NAME = "advisor";
 
 type BriefMode = "off" | "auto" | "always";
@@ -43,10 +43,11 @@ interface Config {
 	judgeMaxRetries: number;
 	routing: { enabled: boolean; simple?: ModelRef; complex?: ModelRef };
 	escalation?: ModelRef;
+	maxCostPerTask: number;
 }
 
 interface AdvisorDetails {
-	kind: "advisor" | "error" | "max_uses_exceeded" | "not_configured";
+	kind: "advisor" | "error" | "max_uses_exceeded" | "budget_exceeded" | "not_configured";
 	version: string;
 	advisor?: { provider: string; model: string; spec: string };
 	usage?: {
@@ -79,6 +80,7 @@ const DEFAULT_CONFIG: Config = {
 	judge: "off",
 	judgeMaxRetries: 1,
 	routing: { enabled: false },
+	maxCostPerTask: 0,
 };
 
 const ADVISOR_SYSTEM = `You are a private advisor for a coding/research executor agent.
@@ -421,6 +423,28 @@ function currentTaskEntries(branch: SessionEntry[]): { entries: SessionEntry[]; 
 	return { entries: branch.slice(start), prompt };
 }
 
+/**
+ * Total advisor-layer spend (USD) recorded for the current task: advisor tool
+ * calls plus brief and judge messages. Models without pricing metadata report
+ * zero cost and are invisible to the budget.
+ */
+function taskAdvisorSpend(branch: SessionEntry[]): number {
+	let total = 0;
+	for (const entry of currentTaskEntries(branch).entries) {
+		let usage: AdvisorDetails["usage"] | undefined;
+		if (entry.type === "message") {
+			const message = entry.message;
+			if (message.role === "toolResult" && message.toolName === TOOL_NAME) {
+				usage = (message.details as Partial<AdvisorDetails> | undefined)?.usage;
+			}
+		} else if (entry.type === "custom_message" && (entry.customType === "advisor-brief" || entry.customType === "advisor-judge")) {
+			usage = (entry.details as { usage?: AdvisorDetails["usage"] } | undefined)?.usage;
+		}
+		if (usage?.cost) total += usage.cost;
+	}
+	return total;
+}
+
 function judgeFailuresThisTask(branch: SessionEntry[]): number {
 	return currentTaskEntries(branch).entries.filter(
 		(entry) => entry.type === "custom_message" && entry.customType === "advisor-judge",
@@ -501,11 +525,11 @@ function resolveModel(ctx: { modelRegistry: ExtensionCommandContext["modelRegist
 	return { ok: false, error: `Ambiguous model spec ${normalized}: ${fuzzy.map(modelLabel).slice(0, 8).join(", ")}` };
 }
 
-function parsePairArgs(args: string): { executor?: string; advisor?: string; max?: number; words?: number; brief?: BriefMode; errors: string[] } {
-	const out: { executor?: string; advisor?: string; max?: number; words?: number; brief?: BriefMode; errors: string[] } = { errors: [] };
+function parsePairArgs(args: string): { executor?: string; advisor?: string; max?: number; words?: number; brief?: BriefMode; budget?: number; errors: string[] } {
+	const out: { executor?: string; advisor?: string; max?: number; words?: number; brief?: BriefMode; budget?: number; errors: string[] } = { errors: [] };
 	const positional: string[] = [];
 	for (const token of args.trim().split(/\s+/).filter(Boolean)) {
-		const match = token.match(/^(executor|exec|advisor|adv|max|uses|words|brief):(.+)$/i);
+		const match = token.match(/^(executor|exec|advisor|adv|max|uses|words|brief|budget):(.+)$/i);
 		if (!match) {
 			positional.push(token);
 			continue;
@@ -516,6 +540,7 @@ function parsePairArgs(args: string): { executor?: string; advisor?: string; max
 		else if (key === "advisor" || key === "adv") out.advisor = value;
 		else if (key === "max" || key === "uses") out.max = Number(value);
 		else if (key === "words") out.words = Number(value);
+		else if (key === "budget") out.budget = value.toLowerCase() === "off" ? 0 : Number(value.replace(/^\$/, ""));
 		else if (key === "brief") {
 			const mode = value.toLowerCase();
 			if (mode === "off" || mode === "auto" || mode === "always") out.brief = mode;
@@ -526,6 +551,7 @@ function parsePairArgs(args: string): { executor?: string; advisor?: string; max
 	if (!out.advisor && positional[1]) out.advisor = positional[1];
 	if (out.max !== undefined && (!Number.isInteger(out.max) || out.max < 0)) out.errors.push("max must be a non-negative integer");
 	if (out.words !== undefined && (!Number.isInteger(out.words) || out.words < 20)) out.errors.push("words must be an integer >= 20");
+	if (out.budget !== undefined && (!Number.isFinite(out.budget) || out.budget < 0)) out.errors.push("budget must be a non-negative number or off");
 	return out;
 }
 
@@ -541,6 +567,7 @@ function statusText(config: Config, executor?: Model<Api>) {
 		`completion judge: ${config.judge}${config.judge !== "off" ? ` (max retries ${config.judgeMaxRetries})` : ""}`,
 		`routing: ${config.routing.enabled ? `simple→${formatModel(config.routing.simple)} complex→${formatModel(config.routing.complex)}` : "off"}`,
 		`escalation advisor: ${config.escalation ? formatModel(config.escalation) : "off"}`,
+		`budget/task: ${config.maxCostPerTask > 0 ? `$${config.maxCostPerTask}` : "off"}`,
 		`config: ${configPath()}`,
 	].join("\n");
 }
@@ -663,6 +690,25 @@ export default function (pi: ExtensionAPI) {
 			persist({ ...config, brief: raw });
 			updateStatus(ctx);
 			ctx.ui.notify(`Advisor brief mode: ${raw}`, "info");
+		},
+	});
+
+	pi.registerCommand("advisor-budget", {
+		description: "Set max advisor spend in USD per user task, across brief, advisor calls, and judge: /advisor-budget <usd|off>",
+		handler: async (args, ctx) => {
+			const raw = args.trim().toLowerCase();
+			if (!raw) {
+				ctx.ui.notify(`Advisor budget/task: ${config.maxCostPerTask > 0 ? `$${config.maxCostPerTask}` : "off"}`, "info");
+				return;
+			}
+			const value = raw === "off" ? 0 : Number(raw.replace(/^\$/, ""));
+			if (!Number.isFinite(value) || value < 0) {
+				ctx.ui.notify("Usage: /advisor-budget <usd|off>", "error");
+				return;
+			}
+			persist({ ...config, maxCostPerTask: value });
+			updateStatus(ctx);
+			ctx.ui.notify(value > 0 ? `Advisor budget/task: $${value}` : "Advisor budget disabled", "info");
 		},
 	});
 
@@ -806,6 +852,7 @@ export default function (pi: ExtensionAPI) {
 				maxUsesPerTask: parsed.max ?? config.maxUsesPerTask,
 				maxWords: parsed.words ?? config.maxWords,
 				brief: parsed.brief ?? config.brief,
+				maxCostPerTask: parsed.budget ?? config.maxCostPerTask,
 			});
 			updateStatus(ctx);
 			ctx.ui.notify(`Executor: ${modelLabel(executor.model)}\nAdvisor: ${modelLabel(advisor.model)}`, "info");
@@ -864,6 +911,10 @@ export default function (pi: ExtensionAPI) {
 		const { entries, prompt } = currentTaskEntries(branch);
 		if (!entries.length || !prompt) return;
 		if (config.judge === "auto" && !classifyTask(prompt).required) return;
+		if (config.maxCostPerTask > 0 && taskAdvisorSpend(branch) >= config.maxCostPerTask) {
+			if (ctx.hasUI) ctx.ui.notify("Advisor judge skipped: per-task advisor budget exhausted", "warning");
+			return;
+		}
 
 		const priorFailures = judgeFailuresThisTask(branch);
 		const useEscalation = priorFailures > 0 && config.escalation ? config.escalation : config.advisor;
@@ -966,6 +1017,16 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			if (config.maxCostPerTask > 0) {
+				const spend = taskAdvisorSpend(branch);
+				if (spend >= config.maxCostPerTask) {
+					return {
+						content: [{ type: "text", text: `Advisor budget exhausted for this task ($${spend.toFixed(4)} of $${config.maxCostPerTask.toFixed(2)}). Continue without further advice.` }],
+						details: { kind: "budget_exceeded", version: VERSION, advisor: config.advisor, callsUsed, maxUsesPerTask: config.maxUsesPerTask, truncatedTranscript: false } satisfies AdvisorDetails,
+					};
+				}
+			}
+
 			let advisorRef = config.advisor;
 			let escalated: string | undefined;
 			if (config.escalation) {
@@ -1022,6 +1083,7 @@ export default function (pi: ExtensionAPI) {
 			let out = "";
 			if (details?.kind === "advisor") out += theme.fg("success", "✓ advisor guidance");
 			else if (details?.kind === "max_uses_exceeded") out += theme.fg("warning", "advisor cap reached");
+			else if (details?.kind === "budget_exceeded") out += theme.fg("warning", "advisor budget reached");
 			else out += theme.fg("warning", "advisor");
 			if (details?.advisor) out += theme.fg("muted", ` ${formatModel(details.advisor)}`);
 			if (details?.escalated) out += theme.fg("warning", " escalated");
