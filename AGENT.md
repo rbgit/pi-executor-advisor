@@ -163,6 +163,7 @@ Expected package files (all required; `npm pack --dry-run` must list every one):
 - `README.md`
 - `AGENT.md` / `AGENTS.md`
 - `package.json`
+- `assets/architecture-light.svg` / `assets/architecture-dark.svg` — README architecture diagram (the mermaid source lives in a collapsible block in README.md; regenerate both SVGs with mermaid-cli when it changes)
 - `extensions/advisor/index.ts`
 - `extensions/advisor-gate/index.ts`
 - `extensions/shared/classify.ts` — shared classifier imported by both extensions; removing it breaks both at load time.
