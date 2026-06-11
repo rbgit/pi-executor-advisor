@@ -9,18 +9,42 @@ Inspired by:
 - Anthropic: [The Advisor Strategy](https://claude.com/blog/the-advisor-strategy)
 - Paper: [How to Train Your Advisor: Steering Black-Box LLMs with Advisor Models](https://arxiv.org/pdf/2510.02453)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-dark.svg">
+  <img alt="Architecture: a user task is optionally routed by complexity and rewritten into an execution brief by the advisor, then a cheap/fast executor model works with tools, privately consulting a stronger advisor model. An optional completion judge passes the answer to the user or sends required fixes back to the executor. The advisor gate blocks unsafe mutations, and all events feed a local event log with a dashboard and chat view." src="./assets/architecture-light.svg">
+</picture>
+
+<details>
+<summary>Diagram source (mermaid)</summary>
+
 ```mermaid
 flowchart LR
-  U["User task"] --> P["pi session"]
-  P --> E["Executor model"]
-  E --> T["Normal tools: files, shell, tests"]
-  E --> X["advisor tool"]
-  X --> A["Configured advisor model"]
-  A --> E
-  X --> L["local event log"]
-  L --> D["dashboard and chat view"]
-  E --> R["User-facing answer"]
+    U(["User task"]) --> R{{"Router<br/>(optional)"}}
+    R --> B["Execution brief<br/>by advisor (optional)"]
+    B --> E["Executor model<br/>(cheap / fast)"]
+    E <--> T["Tools: files,<br/>shell, tests"]
+    E -- "advisor(focus?)" --> A["Advisor model<br/>(stronger)"]
+    A -- "private guidance" --> E
+    G["Advisor gate"] -. "blocks unsafe<br/>mutations" .-> E
+    E --> J{{"Completion judge<br/>(optional)"}}
+    J -- "FAIL: required fixes" --> E
+    J -- "PASS" --> ANS(["User-facing answer"])
+    A -.-> L[("Event log")]
+    G -.-> L
+    J -.-> L
+    L --> D["Dashboard &<br/>chat view"]
 ```
+
+Regenerate the SVGs after editing (requires Chromium for mermaid-cli):
+
+```bash
+npx -y @mermaid-js/mermaid-cli -c <(echo '{"htmlLabels":false,"flowchart":{"htmlLabels":false}}') \
+  -i diagram.mmd -o assets/architecture-light.svg -t neutral -b transparent
+npx -y @mermaid-js/mermaid-cli -c <(echo '{"htmlLabels":false,"flowchart":{"htmlLabels":false}}') \
+  -i diagram.mmd -o assets/architecture-dark.svg -t dark -b transparent
+```
+
+</details>
 
 ## What problem does this solve?
 
@@ -476,6 +500,9 @@ The extension truncates very large transcripts using `maxTranscriptChars`. Incre
 ├── LICENSE
 ├── package.json
 ├── README.md
+├── assets/
+│   ├── architecture-dark.svg
+│   └── architecture-light.svg
 └── extensions/
     ├── advisor/
     │   └── index.ts
